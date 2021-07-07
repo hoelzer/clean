@@ -10,7 +10,7 @@ Author: hoelzer.martin@gmail.com
 
 // Parameters sanity checking
 
-Set valid_params = ['max_cores', 'cores', 'max_memory', 'memory', 'profile', 'help', 'nano', 'illumina', 'illumina_single_end', 'fasta', 'list', 'host', 'own', 'control', 'rm_rrna', 'bbduk', 'bbduk_kmer', 'bbduk_qin', 'reads_rna', 'output', 'multiqc_dir', 'nf_runinfo_dir', 'databases', 'condaCacheDir', 'singularityCacheDir', 'singularityCacheDir', 'cloudProcess', 'conda-cache-dir', 'singularity-cache-dir', 'cloud-process'] // don't ask me why there is also 'conda-cache-dir', 'singularity-cache-dir', 'cloud-process'
+Set valid_params = ['max_cores', 'cores', 'max_memory', 'memory', 'profile', 'help', 'nano', 'illumina', 'illumina_single_end', 'fasta', 'list', 'host', 'own', 'control', 'rm_rrna', 'bbduk', 'bbduk_kmer', 'bbduk_qin', 'reads_rna', 'min_clip', 'output', 'multiqc_dir', 'nf_runinfo_dir', 'databases', 'condaCacheDir', 'singularityCacheDir', 'singularityCacheDir', 'cloudProcess', 'conda-cache-dir', 'singularity-cache-dir', 'cloud-process'] // don't ask me why there is also 'conda-cache-dir', 'singularity-cache-dir', 'cloud-process'
 def parameter_diff = params.keySet() - valid_params
 if (parameter_diff.size() != 0){
     exit 1, "ERROR: Parameter(s) $parameter_diff is/are not valid in the pipeline!\n"
@@ -177,6 +177,8 @@ include { download_host; check_own; concat_contamination } from './modules/get_h
 include { minimap2_fasta; minimap2_nano; minimap2_illumina } from './modules/minimap2'
 include { bbduk } from './modules/bbmap'
 
+include { filter_un_mapped_alignments; make_contamination_bam; filter_soft_clipped_alignments } from './modules/alignment_processing'
+
 include { compress_reads; get_number_of_reads; minimap2Stats; bbdukStats; writeLog } from './modules/utils'
 
 include { fastqc; nanoplot; format_nanoplot_report; quast; multiqc } from './modules/qc'
@@ -241,13 +243,19 @@ workflow clean_fasta {
       .mix(checkedOwn)
       .mix(rRNAChannel).collect()
     concat_contamination( fasta_input_ch.map{ it -> it[0] }, 'minimap2', contamination )
+    // map
     minimap2_fasta(fasta_input_ch, concat_contamination.out.fa)
+    // separate un/mapped reads, compress reads, make contamination bam
+    filter_un_mapped_alignments(minimap2_fasta.out.sam, 'fasta')
+    compress_reads(filter_un_mapped_alignments.out.cleaned_reads.concat(filter_un_mapped_alignments.out.contaminated_reads), 'fasta', 'minimap2')
+    make_contamination_bam(minimap2_fasta.out.sam, 'single', 'minimap2')
+    // log & stats
     writeLog(fasta_input_ch.map{ it -> it[0] }, 'minimap2', fasta_input_ch.map{ it -> it[1] }, contamination)
-    minimap2Stats(minimap2_fasta.out.stats)
+    minimap2Stats(make_contamination_bam.out.idxstats.join(minimap2_fasta.out.num_contigs))
   emit:
     stats = minimap2Stats.out.tsv
     in = fasta_input_ch.map{ it -> it.plus(1, 'all') }
-    out = minimap2_fasta.out.cleaned_contigs.concat(minimap2_fasta.out.contaminated_contigs)
+    out = compress_reads.out
 } 
 
 workflow clean_nano {
@@ -272,12 +280,20 @@ workflow clean_nano {
         .mix(rRNAChannel).collect()
       concat_contamination( nano_input_ch.map{ it -> it[0] }, 'minimap2', contamination )
     }
-    // rename_reads(nano_input_ch, 'single')
+    // map
     minimap2_nano(nano_input_ch, concat_contamination.out.fa)
+    // separate un/mapped reads, compress reads, make contamination bam
+    filter_un_mapped_alignments(minimap2_nano.out.sam, 'single')
+    compress_reads(filter_un_mapped_alignments.out.cleaned_reads.concat(filter_un_mapped_alignments.out.contaminated_reads), 'single', 'minimap2')
+    make_contamination_bam(minimap2_nano.out.sam, 'single', 'minimap2')
+    // filter soft clipped reads
+    if (params.min_clip) {
+      filter_soft_clipped_alignments(make_contamination_bam.out.contamination_bam, params.min_clip, 'minimap2')
+    }
+    // log & stats
     writeLog(nano_input_ch.map{ it -> it[0] }, 'minimap2', nano_input_ch.map{ it -> it[1] }, contamination)
     get_number_of_reads(nano_input_ch, 'single')
-    minimap2Stats(minimap2_nano.out.idxstats.join(get_number_of_reads.out))
-    compress_reads(minimap2_nano.out.cleaned_reads.concat(minimap2_nano.out.contaminated_reads), 'single', 'minimap2')
+    minimap2Stats(make_contamination_bam.out.idxstats.join(get_number_of_reads.out))
   emit:
     stats = minimap2Stats.out.tsv
     in = nano_input_ch.map{ it -> it.plus(1, 'all') }
@@ -306,19 +322,31 @@ workflow clean_illumina {
         .mix(rRNAChannel).collect()
       concat_contamination( illumina_input_ch.map{ it -> it[0] }, params.bbduk ? 'bbduk' : 'minimap2', contamination )
     }
-    // rename_reads(illumina_input_ch, 'paired')
+
     if (params.bbduk){
+      // map
       bbduk(illumina_input_ch, concat_contamination.out.fa, 'paired')
+      // compress reads
+      compress_reads(bbduk.out.cleaned_reads.concat(bbduk.out.contaminated_reads), 'paired', 'bbduk')
+      // log & stats
       writeLog(illumina_input_ch.map{ it -> it[0] }, 'bbduk', illumina_input_ch.map{ it -> it[1] }, contamination)
       bbdukStats(bbduk.out.stats)
-      compress_reads(bbduk.out.cleaned_reads.concat(bbduk.out.contaminated_reads), 'paired', 'bbduk')
       stats = bbdukStats.out.tsv
     } else {
+      // map
       minimap2_illumina(illumina_input_ch, concat_contamination.out.fa, 'paired')
+      // separate un/mapped reads, compress reads, make contamination bam
+      filter_un_mapped_alignments(minimap2_illumina.out.sam, 'paired')
+      compress_reads(filter_un_mapped_alignments.out.cleaned_reads.concat(filter_un_mapped_alignments.out.contaminated_reads), 'paired', 'minimap2')
+      make_contamination_bam(minimap2_illumina.out.sam, 'paired', 'minimap2')
+      // filter soft clipped reads
+      if (params.min_clip) {
+        filter_soft_clipped_alignments(make_contamination_bam.out.contamination_bam, params.min_clip, 'minimap2')
+      }
+      // log & stats
       writeLog(illumina_input_ch.map{ it -> it[0] }, 'minimap2', illumina_input_ch.map{ it -> it[1] }, contamination)
       get_number_of_reads(illumina_input_ch, 'paired')
-      minimap2Stats(minimap2_illumina.out.idxstats.join(get_number_of_reads.out))
-      compress_reads(minimap2_illumina.out.cleaned_reads.concat(minimap2_illumina.out.contaminated_reads), 'paired', 'minimap2')
+      minimap2Stats(make_contamination_bam.out.idxstats.join(get_number_of_reads.out))
       stats = minimap2Stats.out.tsv
     }
   emit:
@@ -349,20 +377,32 @@ workflow clean_illumina_single {
         .mix(rRNAChannel).collect()
       concat_contamination( illumina_single_end_input_ch.map{ it -> it[0] }, params.bbduk ? 'bbduk' : 'minimap2', contamination )
     }
-    // rename_reads(illumina_single_end_input_ch, 'single')
+
     if (params.bbduk){
+      // map
       bbduk(illumina_single_end_input_ch, concat_contamination.out.fa, 'single')
+      // compress reads
+      compress_reads(bbduk.out.cleaned_reads.concat(bbduk.out.contaminated_reads), 'single', 'bbduk')
+      // log & stats
       writeLog(illumina_single_end_input_ch.map{ it -> it[0] }, 'bbduk', illumina_single_end_input_ch.map{ it -> it[1] }, contamination)
       bbdukStats(bbduk.out.stats)
       stats = bbdukStats.out.tsv
-      compress_reads(bbduk.out.cleaned_reads.concat(bbduk.out.contaminated_reads), 'single', 'bbduk')
     } else {
+      // map
       minimap2_illumina(illumina_single_end_input_ch, concat_contamination.out.fa, 'single')
+      // separate un/mapped reads, compress reads, make contamination bam
+      filter_un_mapped_alignments(minimap2_illumina.out.sam, 'single')
+      compress_reads(filter_un_mapped_alignments.out.cleaned_reads.concat(filter_un_mapped_alignments.out.contaminated_reads), 'single', 'minimap2')
+      make_contamination_bam(minimap2_illumina.out.sam, 'single', 'minimap2')
+      // filter soft clipped reads
+      if (params.min_clip){
+        filter_soft_clipped_alignments(make_contamination_bam.out.contamination_bam, params.min_clip, 'minimap2')
+      }
+      // log & stats
       writeLog(illumina_single_end_input_ch.map{ it -> it[0] }, 'minimap2', illumina_single_end_input_ch.map{ it -> it[1] }, contamination)
       get_number_of_reads(illumina_single_end_input_ch, 'single')
-      minimap2Stats(minimap2_illumina.out.idxstats.join(get_number_of_reads.out))
+      minimap2Stats(make_contamination_bam.out.idxstats.join(get_number_of_reads.out))
       stats = minimap2Stats.out.tsv
-      compress_reads(minimap2_illumina.out.cleaned_reads.concat(minimap2_illumina.out.contaminated_reads), 'single', 'minimap2')
     }
     emit:
       stats = stats

@@ -79,7 +79,7 @@ process concat_contamination {
 
   output:
   path 'db.fa.gz', emit: fa
-  path 'db.fa.fai'
+  path 'db.fa.fai', emit: fai
   
   script:
   """

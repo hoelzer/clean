@@ -1,52 +1,3 @@
-process rename_reads {
-  label 'smallTask'
-
-  input:
-  tuple val(name), path(reads)
-  val(mode)
-
-  output:
-  tuple val(name), path("R*.fastq")
-
-  script:
-  if ( mode == 'paired' ) {
-    """
-    # replace the space in the header to retain the full read IDs after mapping (the mapper would split the ID otherwise after the first space)
-    # this is working for ENA reads that have at the end of a read id '/1' or '/2'
-    EXAMPLE_ID=\$(zcat ${reads[0]} | head -1)
-    if [[ \$EXAMPLE_ID == */1 ]]; then 
-      if [[ ${reads[0]} =~ \\.gz\$ ]]; then
-        zcat ${reads[0]} | sed 's/ /DECONTAMINATE/g' > R1.fastq
-      else
-        sed 's/ /DECONTAMINATE/g' ${reads[0]} > R1.fastq
-      fi
-      if [[ ${reads[1]} =~ \\.gz\$ ]]; then
-        zcat ${reads[1]} | sed 's/ /DECONTAMINATE/g' > R2.fastq
-      else
-        sed 's/ /DECONTAMINATE/g' ${reads[1]} > R2.fastq
-      fi
-    else
-      # this is for paried-end SRA reads that don't follow the ENA pattern
-      if [[ ${reads[0]} =~ \\.gz\$ ]]; then
-        zcat ${reads[0]} > R1.fastq
-        zcat ${reads[1]} > R2.fastq
-      else
-        mv ${reads[0]} R1.fastq
-        mv ${reads[1]} R2.fastq
-      fi
-    fi
-    """
-  } else {  
-    """
-    if [[ ${reads} =~ \\.gz\$ ]]; then
-      zcat ${reads} | sed 's/ /DECONTAMINATE/g' > R.fastq
-    else
-      sed 's/ /DECONTAMINATE/g' ${reads} > R.fastq
-    fi
-    """
-  }
-}
-
 process compress_reads {
   label 'basics'
 
@@ -58,7 +9,7 @@ process compress_reads {
   val(tool)
 
   output:
-  tuple val(name), val(type), path("${name}*.${type}.fastq.gz")
+  tuple val(name), val(type), path("${name}*.${type}.fast{q,a}.gz")
 
   script:
   if ( mode == 'paired' ) {
@@ -66,10 +17,13 @@ process compress_reads {
     pigz -fc -p ${task.cpus} ${reads[0]} > ${name}_1.${type}.fastq.gz 
     pigz -fc -p ${task.cpus} ${reads[1]} > ${name}_2.${type}.fastq.gz
     """
+  } else if ( mode == 'single' || mode == 'fasta' ) {
+    dtype = (mode == 'single') ? 'q' : 'a'
+    """
+    pigz -fc -p ${task.cpus} ${reads} > ${name}.${type}.fast${dtype}.gz
+    """
   } else {
-    """
-    pigz -fc -p ${task.cpus} ${reads} > ${name}.${type}.fastq.gz
-    """
+    error "Invalid mode: ${mode}"
   }
 }
 
